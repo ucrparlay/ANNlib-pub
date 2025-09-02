@@ -1,0 +1,8 @@
+numpy
+matplotlib
+tqdm
+scipy
+faiss-cpu
+pymilvus  # python -m pip install pymilvus==2.4.9
+psycopg2-binary
+weaviate-client  # pip install -U weaviate-client

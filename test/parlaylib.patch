@@ -1,0 +1,126 @@
+diff --git a/include/parlay/internal/sequence_ops.h b/include/parlay/internal/sequence_ops.h
+index 1cdc12f..2aec30e 100644
+--- a/include/parlay/internal/sequence_ops.h
++++ b/include/parlay/internal/sequence_ops.h
+@@ -5,6 +5,7 @@
+ #include <cmath>
+ #include <cstddef>
+ 
++#include <ranges>
+ #include <algorithm>
+ #include <type_traits>
+ #include <utility>
+@@ -175,7 +176,7 @@ void sliced_for(size_t n, size_t block_size, const F &f, flags fl = no_flag) {
+ 
+ template <typename Seq, typename Monoid>
+ auto reduce_serial(Seq const &A, Monoid&& m) {
+-  static_assert(is_random_access_range_v<Seq>);
++  // static_assert(is_random_access_range_v<Seq>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<Seq>>);
+   using T = monoid_value_type_t<Monoid>;
+   if (A.size() == 0) return m.identity;
+@@ -188,7 +189,7 @@ auto reduce_serial(Seq const &A, Monoid&& m) {
+ 
+ template <typename Seq, typename Monoid>
+ auto reduce(Seq const &A, Monoid&& m, flags fl = no_flag) {
+-  static_assert(is_random_access_range_v<Seq>);
++  // static_assert(is_random_access_range_v<Seq>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<Seq>>);
+   using T = monoid_value_type_t<Monoid>;
+   size_t n = A.size();
+@@ -211,7 +212,7 @@ const flags fl_scan_inclusive = (1 << 4);
+ template <typename In_Seq, typename Out_Seq, typename Monoid>
+ auto scan_serial(In_Seq const &In, Out_Seq Out, Monoid&& m,
+                  monoid_value_type_t<Monoid> offset, flags fl, bool out_uninitialized = false) {
+-  static_assert(is_random_access_range_v<In_Seq>);
++  // static_assert(is_random_access_range_v<In_Seq>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<In_Seq>>);
+   using T = monoid_value_type_t<Monoid>;
+   T r = std::move(offset);
+@@ -237,7 +238,7 @@ auto scan_serial(In_Seq const &In, Out_Seq Out, Monoid&& m,
+   
+ template <typename In_Seq, typename Out_Range, class Monoid>
+ auto scan_(In_Seq const &In, Out_Range Out, Monoid&& m, flags fl, bool out_uninitialized=false) {
+-  static_assert(is_random_access_range_v<In_Seq>);
++  // static_assert(is_random_access_range_v<In_Seq>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<In_Seq>>);
+   using T = monoid_value_type_t<Monoid>;
+   size_t n = In.size();
+@@ -264,7 +265,7 @@ auto scan_inplace(slice<Iterator, Iterator> In, Monoid&& m, flags fl = no_flag)
+ 
+ template <typename In_Seq, typename Monoid>
+ auto scan(In_Seq const &In, Monoid&& m, flags fl = no_flag) {
+-  static_assert(is_random_access_range_v<In_Seq>);
++  // static_assert(is_random_access_range_v<In_Seq>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<In_Seq>>);
+   using T = monoid_value_type_t<Monoid>;
+   auto Out = sequence<T>::uninitialized(In.size());
+@@ -457,8 +458,8 @@ std::pair<size_t, size_t> split_three(slice<InIterator, InIterator> In,
+ 
+ template <typename In_Seq, typename Bool_Seq>
+ auto split_two(In_Seq const &In, Bool_Seq const &Fl, flags fl = no_flag)
+-    -> std::pair<sequence<typename In_Seq::value_type>, size_t> {
+-  using T = typename In_Seq::value_type;
++    -> std::pair<sequence<std::ranges::range_value_t<In_Seq>>, size_t> {
++  using T = std::ranges::range_value_t<In_Seq>;
+   size_t n = In.size();
+   size_t l = num_blocks(n, _block_size);
+   sequence<size_t> Sums(l);
+diff --git a/include/parlay/primitives.h b/include/parlay/primitives.h
+index 4cea1d4..2007817 100644
+--- a/include/parlay/primitives.h
++++ b/include/parlay/primitives.h
+@@ -93,7 +93,7 @@ void copy(R_in&& in, R_out&& out) {
+ template<typename R, typename Monoid,
+          std::enable_if_t<is_monoid_v<Monoid>, int> = 0>
+ auto reduce(R&& r, Monoid&& m) {
+-  static_assert(is_random_access_range_v<R>);
++  // static_assert(is_random_access_range_v<R>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<R>>);
+   return internal::reduce(make_slice(r), std::forward<Monoid>(m));
+ }
+@@ -141,7 +141,7 @@ auto scan_inclusive_inplace(R&& r) {
+ template<typename R, typename Monoid,
+          std::enable_if_t<is_monoid_v<Monoid>, int> = 0>
+ auto scan(R&& r, Monoid&& m) {
+-  static_assert(is_random_access_range_v<R>);
++  // static_assert(is_random_access_range_v<R>);
+   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<R>>);
+   return internal::scan(make_slice(r), std::forward<Monoid>(m));
+ }
+@@ -256,7 +256,7 @@ auto pack_index(BoolSeq&& b) {
+ // r such that f(x) == true.
+ template<typename R, typename UnaryPred>
+ auto filter(R&& r, UnaryPred&& f) {
+-  static_assert(is_random_access_range_v<R>);
++  // static_assert(is_random_access_range_v<R>);
+   static_assert(std::is_invocable_r_v<bool, UnaryPred, range_reference_type_t<R>>);
+   static_assert(std::is_constructible_v<range_value_type_t<R>, range_reference_type_t<R>>);
+   return internal::filter(make_slice(r), std::forward<UnaryPred>(f));
+@@ -975,11 +975,12 @@ auto iota(Index n) {
+ 
+ template <typename R>
+ auto flatten(R&& r) {
++/*
+   static_assert(is_random_access_range_v<R>);
+   static_assert(is_random_access_range_v<range_reference_type_t<R>>);
+   static_assert(std::is_constructible_v<range_value_type_t<range_reference_type_t<R>>,
+                                         range_reference_type_t<range_reference_type_t<R>>>);
+-
++*/
+   // For prvalue ranges, we materialize the range to avoid generating its elements multiple
+   // times, or worse, generating them then taking references to them that dangle!
+   if constexpr (!std::is_reference_v<range_reference_type_t<R>>) {
+diff --git a/include/parlay/slice.h b/include/parlay/slice.h
+index 68c4ddf..5c7b2d9 100644
+--- a/include/parlay/slice.h
++++ b/include/parlay/slice.h
+@@ -52,7 +52,7 @@ auto make_slice(R&& r) {
+ // A slice is a non-owning view of a random-access range defined by an iterator pair.
+ template <typename It, typename S>  
+ struct slice {
+-  static_assert(is_random_access_iterator_v<It>);
++  // static_assert(is_random_access_iterator_v<It>);
+   static_assert(is_sentinel_for_v<It, S>);
+ 
+  public:
