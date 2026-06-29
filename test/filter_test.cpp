@@ -107,27 +107,27 @@ struct desc {
 
 // Visit all the vectors in the given 2D array of points
 // This triggers the page fetching if the vectors are mmap-ed
-template<class T>
-void visit_point(const T &array, size_t dim0, size_t dim1) {
-  parlay::parallel_for(0, dim0, [&](size_t i) {
-    const auto &a = array[i];
-    [[maybe_unused]] volatile auto elem = a.get_coord()[0];
-    for (size_t j = 1; j < dim1; ++j) elem = a.get_coord()[j];
-  });
-}
+// template<class T>
+// void visit_point(const T &array, size_t dim0, size_t dim1) {
+//   parlay::parallel_for(0, dim0, [&](size_t i) {
+//     const auto &a = array[i];
+//     [[maybe_unused]] volatile auto elem = a.get_coord()[0];
+//     for (size_t j = 1; j < dim1; ++j) elem = a.get_coord()[j];
+//   });
+// }
 
-template<typename F>
-auto parse_array(const std::string &s, F f){
-	std::stringstream ss;
-	ss << s;
-	std::string current;
-	std::vector<decltype(f((char*)NULL))> res;
-	while(std::getline(ss, current, ',')) {
-		res.push_back(f(current.c_str()));
-  }
-	// std::sort(res.begin(), res.end());
-	return res;
-};
+// template<typename F>
+// auto parse_array(const std::string &s, F f){
+// 	std::stringstream ss;
+// 	ss << s;
+// 	std::string current;
+// 	std::vector<decltype(f((char*)NULL))> res;
+// 	while(std::getline(ss, current, ',')) {
+// 		res.push_back(f(current.c_str()));
+//   }
+// 	// std::sort(res.begin(), res.end());
+// 	return res;
+// };
 
 template<typename U>
 void run_test(commandLine parameter)  // intend to be pass-by-value manner
