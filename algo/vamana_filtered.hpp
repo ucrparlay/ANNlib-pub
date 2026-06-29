@@ -514,7 +514,7 @@ namespace ANN {
 
       // auto &eps_u = entrance;
       search_control sctrl;  // TODO: use designated initializers in C++20
-      sctrl.log_per_stat = i;
+      // sctrl.log_per_stat = i;
       // sctrl.filtered = filtered;
       // sctrl.searching = false;
       auto eps = g.get_node(u)->get_label() |

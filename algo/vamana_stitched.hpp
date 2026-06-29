@@ -459,7 +459,7 @@ void stitched_vamana<Desc>::insert_batch_impl(Iter begin, Iter end, label_t labe
 
     // auto &eps_u = entrance;
     search_control sctrl;  // TODO: use designated initializers in C++20
-    sctrl.log_per_stat = i;
+    // sctrl.log_per_stat = i;
     // sctrl.filtered = filtered;
     // sctrl.searching = false;
     seq_conn res = algo::beamSearch(
