@@ -11,13 +11,18 @@ class MarcoProcessor:
         Initialize file paths and load header information from the binary files.
         """
         self.marco_dir = Path(base_dir)
-        self.marco_embed_dir = self.marco_dir / "embedding"
-        self.marco_query_dir = self.marco_dir / "query"
+        # self.marco_embed_dir = self.marco_dir / "embedding"
+        # self.marco_query_dir = self.marco_dir / "query"
 
-        self.embedding_file = self.marco_embed_dir / "marco.768D.10M.euclidean.fbin"
-        self.meta_file = self.marco_embed_dir / "meta.bin"
-        self.metaidx_file = self.marco_embed_dir / "metaidx.bin"
-        self.filter_file = self.marco_embed_dir / "marco.filter.base.10M.txt"
+        # self.embedding_file = self.marco_embed_dir / "marco.768D.10M.euclidean.fbin"
+        # self.meta_file = self.marco_embed_dir / "meta.bin"
+        # self.metaidx_file = self.marco_embed_dir / "metaidx.bin"
+        # self.filter_file = self.marco_embed_dir / "marco.filter.base.10M.txt"
+
+        self.embedding_file = self.marco_dir / "base.fbin"
+        self.meta_file = self.marco_dir / "meta.bin"
+        self.metaidx_file = self.marco_dir / "metaidx.bin"
+        self.filter_file = self.marco_dir / "filter_labels.txt"
 
         self.marco_embed = defaultdict(int)
         self.labels_all = []
@@ -112,6 +117,7 @@ class YFCCProcessor:
         self.base_dir = Path(base_dir)
         self.ds = YFCC100MDataset(base_dir=base_dir)
         print(self.ds)  # ds.__str__()
+        self.ds.prepare()
 
         self.dataset_metadata = self.ds.get_dataset_metadata()
         # self.query_metadata = self.ds.get_queries_metadata()
@@ -187,7 +193,8 @@ class YFCCProcessor:
 
 
 if __name__ == '__main__':
-    data_dir = Path("/data/jsu068")
+    # data_dir = Path("/data/jsu068")
+    data_dir = Path("/scratch/jsu02")
 
     # MS-MARCO
     processor = MarcoProcessor(base_dir=data_dir / "marco")
