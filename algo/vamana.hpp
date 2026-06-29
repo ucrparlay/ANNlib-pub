@@ -119,6 +119,7 @@ public:
 
 	void save(const std::string &idx_path) const;
 
+#ifdef SUPPORT_DELETION
 	void consolidate(){
 		using ea_t = std::remove_cvref_t<decltype(g.get_edges(nid_t()))>;
 		seq<seq<std::pair<nid_t,ea_t>>> ps(cm::num_workers());
@@ -191,6 +192,7 @@ public:
 		erase_bottom();
 	}
 
+#endif
 	template<class Seq=seq<result_t>>
 	Seq search(
 		const coord_t &cq, uint32_t k, uint32_t ef, const search_control &ctrl={}
