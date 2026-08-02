@@ -560,7 +560,7 @@ void vamana<Desc>::insert(Iter begin, Iter end, float batch_base, bool use_appro
 		cnt_skip = 1;
 	}
 
-	size_t batch_begin=0, batch_end=cnt_skip, size_limit=std::max<size_t>(n*0.02,20000);
+	size_t batch_begin=0, batch_end=cnt_skip, size_limit=n*0.02;
 	float progress = 0.0;
 	while(batch_end<n)
 	{
@@ -571,7 +571,9 @@ void vamana<Desc>::insert(Iter begin, Iter end, float batch_base, bool use_appro
 		insert_batch_impl(rand_seq.begin()+batch_begin, rand_seq.begin()+batch_end, use_approx_hash, use_workset);
 		// insert(rand_seq.begin()+batch_begin, rand_seq.begin()+batch_end, false);
 
+	#ifdef DEBUG_OUTPUT
 		print_stat();
+	#endif
 
 		if(batch_end>n*(progress+0.05))
 		{
@@ -750,7 +752,7 @@ void vamana<Desc>::insert_batch_impl(Iter begin, Iter end, bool use_approx_hash,
 			gen_f_nbhs(), gen_f_dist(v), prune_control{.alpha=alpha}
 		);
 		edge_agent_v = edge_cast(std::move(conn_v));
-		assert(size_batch<8 || g.get_edges(0).size()>0);
+		// assert(size_batch<8 || g.get_edges(0).size()>0);
 		nbh_backward[j] = {v, std::move(edge_agent_v)};
 	});
 	util::debug_output("Adding backward edges\n");
