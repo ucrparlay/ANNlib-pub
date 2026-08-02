@@ -217,6 +217,13 @@ private:
 					dim
 				);
 			}
+			void prefetch(nid_t v) const{
+				const coord_t &vc = g.get().get_node(v)->get_coord();
+				const char *p = reinterpret_cast<const char*>(&vc[0]);
+				const size_t bytes = size_t(dim) * sizeof(vc[0]);
+				for(size_t off = 0; off < bytes; off += 64)
+					__builtin_prefetch(p + off, 0, 1);
+			}
 		};
 
 		return dist_evaluator(layer_b, c, dim);
