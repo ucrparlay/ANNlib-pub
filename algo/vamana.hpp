@@ -133,6 +133,7 @@ public:
 	nid_t get_entry_nid() const { return ep; }
 	pid_t get_entry_pid() const { return id_map.get_pid(ep); }
 
+#ifdef SUPPORT_DELETION
 	void consolidate_full(); // traverse all alive nodes, repair dead edges via 2-hop expansion
 
 	// Rebuild from scratch: extract alive nodes, reset internal state, re-insert (see vamana_reinsert_extension.hpp)
@@ -249,6 +250,7 @@ public:
 		//relic.clear();
 		erase_bottom();
 	}
+#endif
 
 	template<class Seq=seq<result_t>>
 	Seq search(
