@@ -10,17 +10,22 @@
 #include <memory>
 #include <functional>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <iterator>
 #include <type_traits>
+#include <typeinfo>
 #include <limits>
 #include <thread>
 #include "algo/algo.hpp"
+#include "graph/graph.hpp"
 #include "map/trivial.hpp"
 #include "util/debug.hpp"
 #include "util/helper.hpp"
 #include "custom/custom.hpp"
+#include "io/reader.hpp"
+#include "io/writer.hpp"
 
 namespace ANN::HNSW_details{
 
@@ -91,8 +96,17 @@ public:
 	);
 	/*
 		Construct from the saved model
-		getter(i) returns the actual data (convertible to type T) of the vector with id i
+		coord(i) returns the actual data (convertible to type coord_t) of the vector with id i
 	*/
+	template<typename F>
+	HNSW(const std::string &idx_path, const F &coord);
+
+	/*
+		Write the whole index (all the layers, the entrances and the levels of
+		the nodes) to `idx_path'. The coordinates are not stored: they are
+		supplied by the caller when loading, as the base set outlives the index.
+	*/
+	void save(const std::string &idx_path) const;
 
 	/*
 		Insert the vectors from [begin, end).
@@ -155,6 +169,9 @@ private:
 	uint32_t m;
 	uint32_t efc;
 	float alpha;
+
+	// per-worker counters of the beam searches issued during the construction
+	seq<size_t> per_visited, per_eval, per_traversed;
 
 	template<typename Iter>
 	void insert_batch_impl(Iter begin, Iter end);
@@ -298,9 +315,13 @@ public:
 		return gen_f_nbhs(layer_b)(u);
 	}
 
-	void save(const std::string &fname) const{
-		std::ofstream f(fname, std::ios::binary);
-		graph::save(layer_b, f);
+private:
+	// Guards against loading an index that was written by a different
+	// instantiation (distance function, point type or graph container).
+	static size_t signature(){
+		return typeid(Desc).hash_code()
+			^ typeid(graph_fat).hash_code()
+			^ typeid(graph_lite).hash_code();
 	}
 };
 
@@ -308,8 +329,103 @@ template<class Desc>
 HNSW<Desc>::HNSW(
 	uint32_t dim_, float m_l_, uint32_t m_, uint32_t efc, float alpha
 ) :
-	dim(dim_), m_l(m_l_), m(m_), efc(efc), alpha(alpha)
+	dim(dim_), m_l(m_l_), m(m_), efc(efc), alpha(alpha),
+	per_visited(cm::num_workers(),0), per_eval(cm::num_workers(),0), per_traversed(cm::num_workers(),0)
 {
+}
+
+template<class Desc>
+void HNSW<Desc>::save(const std::string &idx_path) const
+{
+	io::buffered_writer w(idx_path);
+	/* Meta info */
+	w(int(0x01)); // version
+	w("HNSWmlvl", 8); // 8-byte algorithm identity
+	w(signature());
+
+	/* Build parameters */
+	w(dim);
+	w(m_l);
+	w(m);
+	w(efc);
+	w(alpha);
+
+	/* Entrances of the top layer */
+	w(entrance.size());
+	w(entrance);
+
+	/* Level of each node, indexed by nid, since `node_fat' is not part of
+	   the graph dump and the level decides which layers a node belongs to */
+	seq<uint32_t> levels(layer_b.num_nodes());
+	layer_b.for_each([&](auto p){
+		levels[p.get_id()] = p->level;
+	});
+	w(levels.size());
+	w(levels);
+
+	/* Graphs: the bottom layer, then the upper layers 1..cnt_layers-1 */
+	const uint32_t cnt_layers = layer_u.size();
+	w(cnt_layers);
+	graph::save(layer_b, w);
+	for(uint32_t l=1; l<cnt_layers; ++l)
+		graph::save(layer_u[l], w);
+}
+
+template<class Desc>
+template<typename F>
+HNSW<Desc>::HNSW(const std::string &idx_path, const F &coord) :
+	per_visited(cm::num_workers(),0), per_eval(cm::num_workers(),0), per_traversed(cm::num_workers(),0)
+{
+	io::mmap_reader r(idx_path);
+	/* Meta info. Checked eagerly: a mismatch means the rest of the stream
+	   would be parsed at the wrong offsets, so bail out instead of asserting
+	   (the asserts would vanish under NDEBUG while the reads would not) */
+	const int version = r();
+	if(version!=0x01)
+		throw std::runtime_error(idx_path+": unsupported index version");
+	const std::string magic = (std::string)r(8);
+	if(magic!="HNSWmlvl")
+		throw std::runtime_error(idx_path+": not an HNSW index");
+	const size_t sig = r();
+	if(sig!=signature())
+		throw std::runtime_error(idx_path+": index was built by another HNSW instantiation");
+
+	/* Build parameters */
+	dim = r();
+	m_l = r();
+	m = r();
+	efc = r();
+	alpha = r();
+
+	/* Entrances */
+	const size_t cnt_ep = r();
+	seq<nid_t> eps = r(cnt_ep);
+	entrance = std::move(eps);
+
+	/* Levels, indexed by nid */
+	const size_t cnt_nodes = r();
+	seq<uint32_t> levels = r(cnt_nodes);
+
+	auto get_coord = [&](nid_t u) -> coord_t{
+		return coord(id_map.get_pid(u));
+	};
+	// The dump keeps the neighbor ids only, so the distances are recomputed
+	auto load_edge = [&](nid_t u, nid_t v){
+		return edge{{Desc::distance(get_coord(u), get_coord(v), dim), v}};
+	};
+
+	/* Graphs, in the order written by save() */
+	const uint32_t cnt_layers = r();
+	layer_b = graph::load<graph_fat>(r,
+		[&](nid_t u){return node_fat{levels[u], get_coord(u)};},
+		load_edge
+	);
+	layer_u.resize(cnt_layers);
+	for(uint32_t l=1; l<cnt_layers; ++l)
+		layer_u[l] = graph::load<graph_lite>(r,
+			[](nid_t){return node_lite{};},
+			load_edge
+		);
 }
 
 template<class Desc>
@@ -347,7 +463,7 @@ void HNSW<Desc>::insert(Iter begin, Iter end, float batch_base)
 		cnt_skip = 1;
 	}
 
-	size_t batch_begin=0, batch_end=cnt_skip, size_limit=1000;//std::max<size_t>(n*0.02,20000);
+	size_t batch_begin=0, batch_end=cnt_skip, size_limit=n*0.02;//std::max<size_t>(n*0.02,20000);
 	float progress = 0.0;
 	while(batch_end<n)
 	{
@@ -362,24 +478,21 @@ void HNSW<Desc>::insert(Iter begin, Iter end, float batch_base)
 		{
 			progress = float(batch_end)/n;
 			fprintf(stderr, "Built: %3.2f%%\n", progress*100);
-			/*
 			fprintf(stderr, "# visited: %lu\n", cm::reduce(per_visited));
 			fprintf(stderr, "# eval: %lu\n", cm::reduce(per_eval));
-			fprintf(stderr, "size of C: %lu\n", cm::reduce(per_size_C));
-			per_visited.clear();
-			per_eval.clear();
-			per_size_C.clear();
-			*/
+			fprintf(stderr, "# traversed: %lu\n", cm::reduce(per_traversed));
+			per_visited.assign(cm::num_workers(), 0);
+			per_eval.assign(cm::num_workers(), 0);
+			per_traversed.assign(cm::num_workers(), 0);
 		}
 	}
-/*
+
 	fprintf(stderr, "# visited: %lu\n", cm::reduce(per_visited));
 	fprintf(stderr, "# eval: %lu\n", cm::reduce(per_eval));
-	fprintf(stderr, "size of C: %lu\n", cm::reduce(per_size_C));
-	per_visited.clear();
-	per_eval.clear();
-	per_size_C.clear();
-*/
+	fprintf(stderr, "# traversed: %lu\n", cm::reduce(per_traversed));
+	per_visited.assign(cm::num_workers(), 0);
+	per_eval.assign(cm::num_workers(), 0);
+	per_traversed.assign(cm::num_workers(), 0);
 }
 
 template<class Desc>
@@ -492,9 +605,18 @@ void HNSW<Desc>::insert_batch_impl(Iter begin, Iter end)
 
 			auto &eps_u = eps[i];
 			auto search_layer = [&](const auto &g) -> decltype(auto){
+				algo::statistic stat;
 				search_control ctrl; // TODO: use designated initializers in C++20
-				ctrl.log_per_stat = i;
-				return algo::beamSearch(gen_f_nbhs(g), gen_f_dist(u), eps_u, efc, ctrl).first;
+				ctrl.log_stat = &stat;
+				auto res = algo::beamSearch(
+					gen_f_nbhs(g), gen_f_dist(u), eps_u, efc, ctrl
+				).first;
+
+				const auto wid = cm::worker_id();
+				per_visited[wid] += stat.cnt_visited;
+				per_eval[wid] += stat.cnt_eval;
+				per_traversed[wid] += stat.cnt_traversed;
+				return res;
 			};
 			seq<conn> res = l==0? search_layer(layer_b): search_layer(layer_u[l]);
 
@@ -585,7 +707,7 @@ Seq HNSW<Desc>::search_layer_to(
 	for(uint32_t l=layer_b.get_node(eps[0])->level; l>l_stop; --l)
 	{
 		search_control c{};
-		c.log_per_stat = ctrl.log_per_stat; // whether count dist calculations at all layers
+		c.log_stat = ctrl.log_stat; // whether count dist calculations at all layers
 		// c.limit_eval = ctrl.limit_eval; // whether apply the limit to all layers
 		const auto W = beamSearch(gen_f_nbhs(layer_u[l]), gen_f_dist(cq), eps, ef, c).first;
 		eps.clear();
