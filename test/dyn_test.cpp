@@ -18,16 +18,19 @@
 #include <parlay/primitives.h>
 #include <parlay/parallel.h>
 #include "graph/adj.hpp"
-#include "graph/mono.hpp"
+#include "algo/HNSW.hpp"
 #include "algo/vamana.hpp"
-//#include "algo/HNSW.hpp"
 #include "util/intrin.hpp"
 #include "dist.hpp"
 #include "parlay.hpp"
 #include "benchUtils.h"
 #include "cpam.hpp"
+using ANN::HNSW;
 using ANN::vamana;
-//using ANN::HNSW;
+
+// The graph algorithms under test. HNSW is hierarchical, so its statistics are
+// reported per level; vamana is a single flat graph.
+enum class algo_t{ hnsw, vamana };
 
 parlay::sequence<size_t> per_visited;
 parlay::sequence<size_t> per_eval;
@@ -76,10 +79,9 @@ struct desc{
 
 	template<typename Nid, class Ext, class Edge>
 	using graph_t = ANN::graph::adj_seq<Nid,Ext,Edge>;
-	// using graph_t = ANN::graph::mono<Nid,Ext,Edge>;
 
-	// template<typename Nid, class Ext, class Edge>
-	// using graph_aux = ANN::graph::adj_map<Nid,Ext,Edge>;
+	template<typename Nid, class Ext, class Edge>
+	using graph_aux = ANN::graph::adj_map<Nid,Ext,Edge>;
 };
 
 template<class DescLegacy>
@@ -91,6 +93,34 @@ struct desc_cpam: desc<DescLegacy>{
 	using graph_aux = graph_cpam<Nid,Ext,Edge>;
 };
 
+
+template<class G>
+void print_layers(const G &g)
+{
+	const uint32_t height = g.get_height();
+	printf("Highest level: %u\n", height);
+	puts("level     #vertices         edges        avg. deg");
+	for(uint32_t i=0; i<=height; ++i)
+	{
+		const uint32_t level = height-i;
+		size_t cnt_vertex = g.num_nodes(level);
+		size_t cnt_degree = g.num_edges(level);
+		printf("#%2u: %14lu %16lu %10.2f\n", level, cnt_vertex, cnt_degree,
+			float(cnt_degree)/cnt_vertex);
+	}
+}
+
+// Counterpart of print_layers() for the single-layer graphs. max_deg() is left
+// out on purpose: it costs another full pass over the nodes.
+template<class G>
+void print_flat(const G &g)
+{
+	const size_t cnt_vertex = g.num_nodes();
+	const size_t cnt_degree = g.num_edges();
+	puts("     #vertices            edges        avg. deg");
+	printf("%14lu %16lu %10.2f\n", cnt_vertex, cnt_degree,
+		float(cnt_degree)/cnt_vertex);
+}
 
 // Visit all the vectors in the given 2D array of points
 // This triggers the page fetching if the vectors are mmap-ed
@@ -217,9 +247,9 @@ template<class G, class Seq>
 auto find_nbhs(const G &g, const Seq &q, uint32_t k, uint32_t ef)
 {
 	const size_t cnt_query = q.size();
-	per_visited.resize(cnt_query);
-	per_eval.resize(cnt_query);
-	per_size_C.resize(cnt_query);
+	// per_visited.resize(cnt_query);
+	// per_eval.resize(cnt_query);
+	// per_size_C.resize(cnt_query);
 
 	using seq_result = parlay::sequence<typename G::result_t>;
 	parlay::sequence<seq_result> res(cnt_query);
@@ -240,26 +270,27 @@ auto find_nbhs(const G &g, const Seq &q, uint32_t k, uint32_t ef)
 		search();
 	const double time_query = t.next_time()/rounds;
 	const double qps = cnt_query/time_query;
-	printf("Find neighbors: %.4f s, %e kqps\n", time_query, qps/1000);
+	printf("Find neighbors: %.4f s, %e kqps (ef=%u k=%u nq=%lu)\n",
+		time_query, qps/1000, ef, k, cnt_query);
 
-	printf("# visited: %lu\n", parlay::reduce(per_visited,parlay::addm<size_t>{}));
-	printf("# eval: %lu\n", parlay::reduce(per_eval,parlay::addm<size_t>{}));
-	printf("size of C: %lu\n", parlay::reduce(per_size_C,parlay::addm<size_t>{}));
+	// printf("# visited: %lu\n", parlay::reduce(per_visited,parlay::addm<size_t>{}));
+	// printf("# eval: %lu\n", parlay::reduce(per_eval,parlay::addm<size_t>{}));
+	// printf("size of C: %lu\n", parlay::reduce(per_size_C,parlay::addm<size_t>{}));
 
-	parlay::sort_inplace(per_visited);
-	parlay::sort_inplace(per_eval);
-	parlay::sort_inplace(per_size_C);
-	const double tail_ratio[] = {0.9, 0.99, 0.999};
-	for(size_t i=0; i<sizeof(tail_ratio)/sizeof(*tail_ratio); ++i)
-	{
-		const auto r = tail_ratio[i];
-		const uint32_t tail_index = r*cnt_query;
-		printf("%.4f tail stat (at %u):\n", r, tail_index);
+	// parlay::sort_inplace(per_visited);
+	// parlay::sort_inplace(per_eval);
+	// parlay::sort_inplace(per_size_C);
+	// const double tail_ratio[] = {0.9, 0.99, 0.999};
+	// for(size_t i=0; i<sizeof(tail_ratio)/sizeof(*tail_ratio); ++i)
+	// {
+	// 	const auto r = tail_ratio[i];
+	// 	const uint32_t tail_index = r*cnt_query;
+	// 	printf("%.4f tail stat (at %u):\n", r, tail_index);
 
-		printf("\t# visited: %lu\n", per_visited[tail_index]);
-		printf("\t# eval: %lu\n", per_eval[tail_index]);
-		printf("\tsize of C: %lu\n", per_size_C[tail_index]);
-	}
+	// 	printf("\t# visited: %lu\n", per_visited[tail_index]);
+	// 	printf("\t# eval: %lu\n", per_eval[tail_index]);
+	// 	printf("\tsize of C: %lu\n", per_size_C[tail_index]);
+	// }
 
 	return res;
 }
@@ -346,7 +377,7 @@ auto parse_array(const std::string &s, F f){
 	return res;
 };
 
-template<typename U>
+template<algo_t Algo, typename U>
 void run_test(commandLine parameter) // intend to be pass-by-value manner
 {
 	const char *file_in = parameter.getOptionValue("-in");
@@ -354,7 +385,7 @@ void run_test(commandLine parameter) // intend to be pass-by-value manner
 	const size_t size_step = parameter.getOptionLongValue("-step", 0);
 	size_t size_max = parameter.getOptionLongValue("-max", 0);
 	const uint32_t m = parameter.getOptionIntValue("-m", 40);
-	// const float ml = parameter.getOptionDoubleValue("-ml", 0.36);
+	const float ml = parameter.getOptionDoubleValue("-ml", 0.36);
 	const uint32_t efc = parameter.getOptionIntValue("-efc", 60);
 	const float alpha = parameter.getOptionDoubleValue("-alpha", 1);
 	const float batch_base = parameter.getOptionDoubleValue("-b", 2);
@@ -362,8 +393,14 @@ void run_test(commandLine parameter) // intend to be pass-by-value manner
 	const uint32_t k = parameter.getOptionIntValue("-k", 10);
 	// const uint32_t ef = parameter.getOptionIntValue("-ef", m*20);
 	const auto efs = parse_array(parameter.getOptionValue("-efs"), atoi);
-	const char* gt_folder = parameter.getOptionValue("-gtf");
-	
+	const char* file_gt = parameter.getOptionValue("-gt");
+	// const char* gt_folder = parameter.getOptionValue("-gtf");
+	const char* file_out = parameter.getOptionValue("-out");
+	const char* file_load = parameter.getOptionValue("-load");
+
+	// HNSW takes (m_l, m, efc); vamana takes (R, L) which map onto (m, efc)
+	using index_t = std::conditional_t<Algo==algo_t::hnsw, HNSW<U>, vamana<U>>;
+
 	parlay::internal::timer t("run_test:prepare", true);
 
 	using T = typename U::point_t::elem_t;
@@ -385,10 +422,64 @@ void run_test(commandLine parameter) // intend to be pass-by-value manner
 	visit_point(q, q.size(), dim);
 	t.next("Prefetch vectors");
 
-	decltype(ps) baseset;
-	vamana<U> g(dim, m, efc, alpha);
-	//HNSW<U> g(dim, ml, m, efc, alpha);
-	puts("Initialize vamana");
+	parlay::sequence<parlay::sequence<uint32_t>> gt;
+	uint32_t maxk = 0;
+	if(file_gt)
+	{
+		puts("Load groundtruth");
+		printf("read from groundtruth %s\n", file_gt);
+		std::tie(gt, maxk) = load_point(file_gt, gt_converter<uint32_t>{});
+		t.next("Finish gt load");
+	}
+
+	// The index does not own the vectors, so a loaded index takes its
+	// coordinates straight out of the base set that was just read.
+	auto coord_of = [&](uint32_t pid){
+		return ps[pid].get_coord();
+	};
+
+	const char *algo_name = Algo==algo_t::hnsw? "HNSW": "vamana";
+	auto build_index = [&]() -> index_t{
+		if(file_load)
+		{
+			printf("Load %s index from %s\n", algo_name, file_load);
+			return index_t(file_load, coord_of);
+		}
+		printf("Initialize %s\n", algo_name);
+		if constexpr(Algo==algo_t::hnsw)
+			return index_t(dim, ml, m, efc, alpha);
+		else
+			return index_t(dim, m, efc, alpha);
+	};
+
+	index_t g = build_index();
+	t.next(file_load? "Load the index": "Initialize the index");
+
+	auto print_index_stat = [&](const index_t &idx){
+		if constexpr(Algo==algo_t::hnsw)
+			print_layers(idx);
+		else
+			print_flat(idx);
+	};
+
+	auto search_sweep = [&](const index_t &idx){
+		for(auto ef : efs)
+		{
+			printf("Search for neighbors ef=%u\n", ef);
+			auto res = find_nbhs(idx, q, k, ef);
+			puts("Compute recall");
+			calc_recall(q, res, gt, k);
+		}
+	};
+
+	if(file_load)
+	{
+		puts("Collect statistics");
+		print_index_stat(g);
+		search_sweep(g);
+		puts("---");
+		return;
+	}
 
 	for(size_t size_last=0, size_curr=size_init;
 		size_curr<=size_max;
@@ -404,40 +495,30 @@ void run_test(commandLine parameter) // intend to be pass-by-value manner
 		t.next("Finish insertion");
 
 		puts("Collect statistics");
-		g.print_stat();
+		print_index_stat(g);
 
-		puts("Load groundtruth");
-		std::stringstream path_gt;
-		path_gt << gt_folder << "first_" << size_curr << ".ibin:ibin";
-		printf("read from groundtruth %s\n", path_gt.str().c_str());
-		auto [gt,maxk] = load_point(path_gt.str().c_str(), gt_converter<uint32_t>{});
-		t.next("Finish gt generation");
+		// parlay::sequence<parlay::sequence<uint32_t>> gt;
+		// uint32_t maxk = 0;
+		// if(file_gt)
+		// {
+		// 	puts("Load groundtruth");
+		// 	printf("read from groundtruth %s\n", file_gt);
+		// 	std::tie(gt, maxk) = load_point(file_gt, gt_converter<uint32_t>{});
+		// 	t.next("Finish gt load");
+		// }
 
-		for(auto ef : efs)
-		{
-			puts("Search for neighbors");
-			auto res = find_nbhs(g, q, k, ef);
-			puts("Compute recall");
-			puts("gt: ");
-			for(int i=100; i<105; ++i)
-			{
-				for(int j=0; j<8; ++j)
-					printf("%10u ", gt[i][j]);
-				putchar('\n');
-			}
-			puts("res: ");
-			for(int i=100; i<105; ++i)
-			{
-				for(int j=0; j<8; ++j)
-					printf("%10u ", res[i][j].pid);
-				putchar('\n');
-			}
-			calc_recall(q, res, gt, k);
-		}
+		search_sweep(g);
 
 		puts("---");
 	}
 
+	if(file_out)
+	{
+		printf("Save the %s index to %s\n", algo_name, file_out);
+		parlay::internal::timer t_save("run_test:save", true);
+		g.save(file_out);
+		t_save.next("Finish saving");
+	}
 }
 
 int main(int argc, char **argv)
@@ -447,23 +528,33 @@ int main(int argc, char **argv)
 	putchar('\n');
 
 	commandLine parameter(argc, argv, 
-		"-type <elemType> -dist <distance>"
-		"-ml <m_l> -m <m> -efc <ef_construction> -alpha <alpha> "
-		"-in <baseset> -q <queries> "
+		"-type <elemType> -dist <distance> -algo <hnsw|vamana> "
+		"-ml <m_l> -m <m|R> -efc <ef_construction|L> -alpha <alpha> "
+		"-in <baseset> -q <queries> -gt <groundtruth:ibin> "
 		"-init <init_size> -step <step_size> -max <max_size>"
-		"-k <recall@k> -ef <ef_query> [-beta <beta>,...]"
+		"-k <recall@k> -ef <ef_query> [-beta <beta>,...] "
+		"[-out <index_path>] [-load <index_path>]"
 	);
 
+	const std::string algo = parameter.getOptionValue("-algo", "hnsw");
 	const char *dist_func = parameter.getOptionValue("-dist");
 	auto run_test_helper = [&](auto type){ // emulate a generic lambda in C++20
 		using T = decltype(type);
-		if(!strcmp(dist_func,"L2"))
-			run_test<desc<descr_l2<T>>>(parameter);
-		else if(!strcmp(dist_func,"angular"))
-			run_test<desc<descr_ang<T>>>(parameter);
-		else if(!strcmp(dist_func,"ndot"))
-			run_test<desc<descr_ndot<T>>>(parameter);
-		else throw std::invalid_argument("Unsupported distance type");
+		auto dispatch_dist = [&](auto algo_tag){
+			constexpr algo_t A = decltype(algo_tag)::value;
+			if(!strcmp(dist_func,"L2"))
+				run_test<A,desc<descr_l2<T>>>(parameter);
+			else if(!strcmp(dist_func,"angular"))
+				run_test<A,desc<descr_ang<T>>>(parameter);
+			else if(!strcmp(dist_func,"ndot"))
+				run_test<A,desc<descr_ndot<T>>>(parameter);
+			else throw std::invalid_argument("Unsupported distance type");
+		};
+		if(algo=="hnsw")
+			dispatch_dist(std::integral_constant<algo_t,algo_t::hnsw>{});
+		else if(algo=="vamana")
+			dispatch_dist(std::integral_constant<algo_t,algo_t::vamana>{});
+		else throw std::invalid_argument("Unsupported algorithm");
 	};
 
 	const char* type = parameter.getOptionValue("-type");
