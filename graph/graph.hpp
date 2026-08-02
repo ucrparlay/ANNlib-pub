@@ -86,7 +86,8 @@ struct map_default : std::unordered_map<Key,T>{
 	const T& operator[](const Key &key) const{
 		auto it = _base::find(key);
 		// TODO: match `Key' type
-		assert(it!=_base::end() || (debug_output("key=%u\n",key),false));
+		// assert(it!=_base::end() || (debug_output("key=%u\n",key),false));
+		assert(it!=_base::end());
 		return it->second;
 	}
 };

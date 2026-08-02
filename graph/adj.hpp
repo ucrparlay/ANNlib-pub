@@ -106,6 +106,20 @@ protected:
 		return Seq(origin.begin(), origin.end());
 	}
 
+	// The edge lists handed over by the algorithms are grown by `push_back' or
+	// reserved for the beam size / the degree bound, so their capacity exceeds
+	// the actual degree. Since a node keeps its list for its whole lifetime,
+	// rebuild the list from its iterators to size the storage exactly.
+	template<class Seq>
+	static edgelist fit_edges(Seq &&es){
+		if constexpr(requires{es.capacity() == es.size();}) {
+			if(es.capacity() == es.size()) {
+				return util::to<edgelist>(std::forward<Seq>(es));
+			}
+		}
+		return edgelist(es.begin(), es.end());
+	}
+
 	edgelist pop_edges_impl(node_ptr p, util::dummy<edgelist>){
 		edgelist &nbhs = p.raw->neighbors;
 		edgelist edges = std::move(nbhs);
@@ -173,13 +187,7 @@ public:
 
 	template<class Seq>
 	void set_edges(node_ptr p, Seq&& es){
-		if constexpr(requires{p.raw->neighbors=std::forward<Seq>(es);}){
-			p.raw->neighbors = std::forward<Seq>(es);
-		}
-		else{
-			assert(0);
-			p.raw->neighbors = edgelist(es.begin(),es.end());
-		}
+		p.raw->neighbors = fit_edges(std::forward<Seq>(es));
 	}
 	template<class Iter>
 	void set_edges(Iter begin, Iter end){
@@ -188,7 +196,7 @@ public:
 		cm::parallel_for(0, n, [&](size_t i){
 			auto &&[nid,es] = *(begin+i);
 			get_node(nid).raw->neighbors = 
-				util::to<edgelist>(std::forward<decltype(es)>(es));
+				fit_edges(std::forward<decltype(es)>(es));
 		});
 	}
 	template<class Seq>
