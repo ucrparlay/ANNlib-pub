@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <utility>
 #include <ranges>
+#include <vector>
 
 #include "ANN.hpp"
 #include "custom/custom.hpp"
@@ -22,6 +23,24 @@ using ANN::util::debug_output;
 
 namespace ANN {
 namespace algo {
+
+namespace detail{
+// Only call f_dist.prefetch(v) if that member exists, so f_dist types
+// without it (other algos' dist evaluators, or plain lambdas) keep
+// compiling unchanged.
+template<typename D, typename Nid, typename=void>
+struct has_prefetch : std::false_type{};
+template<typename D, typename Nid>
+struct has_prefetch<D, Nid, std::void_t<
+	decltype(std::declval<const D&>().prefetch(std::declval<Nid>()))
+>> : std::true_type{};
+
+template<typename D, typename Nid>
+void try_prefetch(const D &f_dist, Nid v){
+	if constexpr(has_prefetch<D,Nid>::value)
+		f_dist.prefetch(v);
+}
+} // namespace detail
 
 struct statistic{
 	uint32_t cnt_eval = 0;
@@ -42,6 +61,14 @@ struct search_control
 	std::optional<uint32_t> limit_eval;
 	bool use_approx_hash = true;
 	bool use_workset = true;
+	// Opt-in only: caller must guarantee every currently-alive node's
+	// coordinate lives at a fixed stride from a single base address (true for
+	// a vamana index whose points all come from one contiguous, persistent
+	// buffer -- e.g. one bulk mmap'd load -- with no deletion/reinsertion from
+	// a different buffer since). Not something vamana can verify on its own;
+	// wrong here is a silent wrong-answer bug, not a crash. See
+	// vamana::gen_f_dist_flat.
+	bool flat_coord = false;
 };
 
 struct prune_control {
@@ -61,10 +88,30 @@ auto beamSearch(
 	using conn = util::conn<nid_t>;
 
 	const auto nid_invalid = std::numeric_limits<nid_t>::max();
-	const uint32_t width = std::max(ef, 128u);
-	const uint32_t bits = width>2? std::ceil(std::log2(width))*2-2: 2;
+	// visited[] is an approximate (collision-clobbering) membership table: once
+	// the number of hops exceeds its slot count, an already-seen node can get
+	// evicted and re-discovered, paying for its distance a second time. Sizing
+	// was pinned at 128 slots regardless of ef -- fine up to beam~128, but
+	// beam=640/1280 run ~645/1284 hops through only 128 slots, and the
+	// resulting extra distance calls (measured: +10%/+27% cmps vs ParlayANN at
+	// those two beams specifically, flat below that) is exactly what ParlayANN's
+	// hashset sized `2*(10+beamSize)*max_degree` avoids by scaling with beam
+	// size instead of a fixed cap. Matching that formula's growth rate (their
+	// R=32 default gives bits(n) ~= ceil(log2(ef))+6) here, without needing R
+	// threaded into beamSearch, and keeping this a fixed-size table rather than
+	// their open-addressed auto-growing one.
+	const uint32_t width = ef;
+	// Capped at 16 bits (65536 slots, 256KB) so the table stays cache-resident
+	// even at large ef -- uncapped, beam=1280 reaches 2^17 slots (512KB), and
+	// `visited[hu]==u`'s own cache-miss rate (measured via perf annotate:
+	// 2.62% of beamSearch's time at beam=80 vs 5.87% at beam=1280) eats into
+	// the redundant-cmps savings the larger table exists to buy in the first
+	// place. 16 bits still leaves beam<=640 untouched (their natural size is
+	// already <=2^16) and only trims beam=1280's table, at a measured cost of
+	// +2.25% cmps for a net +1.4% query throughput there.
+	const uint32_t bits = width>2? std::min<uint32_t>(std::ceil(std::log2(width))+6, 16): 2;
 	const uint32_t mask = (1u<<bits)-1;
-	typename cm::seq<nid_t> visited(mask+1, nid_invalid);
+	std::vector<nid_t> visited(mask+1, nid_invalid);
 	std::unordered_set<nid_t> visited_det;
 	uint32_t cnt_visited=0, cnt_traversed=0;
 	typename cm::seq<conn> workset, chosen;
@@ -103,8 +150,11 @@ auto beamSearch(
 
 	uint32_t cnt_eval = 0;
 	uint32_t limit_eval = ctrl.limit_eval.value_or(std::numeric_limits<uint32_t>::max());
+	// candidates found this hop: prefetched here, distances computed below once
+	// the prefetches have had a chance to land (see try_prefetch above).
+	std::vector<nid_t> pending;
 	while (cand.size() > 0) {
-		//if (cand.begin()->d > workset[0].d * ctrl.beta) break;
+		if (cand.begin()->d > workset[0].d * ctrl.beta) break;
 
 		if (++cnt_eval > limit_eval) break;
 
@@ -112,21 +162,26 @@ auto beamSearch(
 		chosen.push_back(*cand.begin());
 		cand.erase(cand.begin());
 
+		pending.clear();
 		util::iter_each(f_nbhs(u), [&](nid_t pv) {
 			cnt_traversed++;
 			if(!visit(pv)) return;
+			detail::try_prefetch(f_dist, pv);
+			pending.push_back(pv);
+		});
 
+		for(nid_t pv : pending) {
 			const auto d = f_dist(pv);
 			auto back_it = cand.end();
 			if(ctrl.use_workset)
 			{
-				if (!(workset.size() < ef || d < workset[0].d)) return;
+				if (!(workset.size() < ef || d < workset[0].d)) continue;
 			}
 			else
 			{
-				if(!(cand.size()<ef || d<(--back_it)->d)) return;
+				if(!(cand.size()<ef || d<(--back_it)->d)) continue;
 			}
-			if (!is_inw.insert(pv).second) return;
+			if (!is_inw.insert(pv).second) continue;
 
 			cand.insert({d,pv});
 			if(ctrl.use_workset)
@@ -153,7 +208,7 @@ auto beamSearch(
 					cand.erase(back_it);
 				}
 			}
-		});
+		}
 	}
 
 	if(ctrl.log_stat)
@@ -172,13 +227,26 @@ auto beamSearch2(
 	using cm = custom<typename L::type>;
 	using nid_t = std::ranges::range_value_t<Seq>;
 	using conn = util::conn<nid_t>;
-
-	uint32_t cnt_eval=0, cnt_visited=0, cnt_traversed=0;
+	uint32_t cnt_eval = 0;
+	uint32_t cnt_visited = 0;
+	uint32_t cnt_traversed = 0;
 
 	const auto nid_invalid = std::numeric_limits<nid_t>::max();
-	const uint32_t bits = ef>2? std::ceil(std::log2(ef))*2-2: 2;
+	// same reasoning as beamSearch's width/bits above -- kept consistent here.
+	const uint32_t bits = ef>2? std::ceil(std::log2(ef))+6: 2;
 	const uint32_t mask = (1u<<bits)-1;
-	typename cm::seq<nid_t> hash_filter(mask+1, nid_invalid);
+	// was `typename cm::seq<...>` (parlay::sequence) for every local below:
+	// its fill/resize-growth always dispatch through parallel_for, including
+	// new_frontier.resize(max_cap) further down, which runs on EVERY loop
+	// iteration (once per hop), not just once per call. beamSearch2 runs
+	// inside insert_batch_impl's outer parallel_for over inserted points, so
+	// each of those nested parallel_for calls is scheduler overhead competing
+	// with the already-saturated outer parallelism -- once per hop, per
+	// inserted point. std::vector's fill/resize are plain sequential loops.
+	// Measured on deep 10M build: 51.96s -> 44.80s (-13.8%); bigann 10M:
+	// 63.24s -> 57.26s (-9.4%); graph byte-identical in both (same edge count,
+	// avg/max degree, entry point, entry point's neighbor list).
+	std::vector<nid_t> hash_filter(mask+1, nid_invalid);
 	auto is_seen = [&](nid_t u) -> bool{
 		const auto hu = cm::hash64(u)&mask;
 		if(hash_filter[hu]==u) return true;
@@ -186,8 +254,8 @@ auto beamSearch2(
 		return false;
 	};
 
-	typename cm::seq<conn> frontier;
-	frontier.reserve(eps.size());
+	std::vector<conn> frontier;
+	frontier.reserve(std::max<size_t>(eps.size(), ef));
 	for(nid_t pe : eps)
 	{
 		const auto h_pe = cm::hash64(pe) & mask;
@@ -197,52 +265,66 @@ auto beamSearch2(
 		frontier.push_back({d,pe});
 	}
 	cm::sort(frontier.begin(), frontier.end());
+	const size_t frontier_buffer_size = std::max<size_t>({
+		frontier.size(), size_t(ef)*2, size_t(1)
+	});
+	size_t frontier_size = frontier.size();
+	frontier.resize(frontier_buffer_size);
 
-	typename cm::seq<conn> unvisited_frontier;
-	unvisited_frontier.push_back(frontier[0]);
+	std::vector<conn> unvisited_frontier(std::max<size_t>(ef, 1));
+	unvisited_frontier[0] = frontier[0];
+	size_t unvisited_frontier_size = 1;
 
-	typename cm::seq<conn> visited;
+	std::vector<conn> visited;
 	visited.reserve(2*ef);
 
 	size_t dist_cmps = eps.size();
 	uint32_t num_visited = 0;
 
-	typename cm::seq<conn> new_frontier, candidates;
-	typename cm::seq<nid_t> keep;
-	while(unvisited_frontier.size()>0)
+	std::vector<conn> new_frontier(frontier_buffer_size), candidates;
+	std::vector<nid_t> keep;
+	// frontier and new_frontier are fixed storage whose logical length is kept
+	// separately.  They alternate roles after every merge, so the hot loop does
+	// not allocate or default-initialize a fresh output range once per graph hop.
+	// 2*ef covers the usual ef + max-degree merge input; resize below still grows
+	// both buffers safely if a graph has degree > ef.
+	candidates.reserve(ef);
+	keep.reserve(ef);
+	while(unvisited_frontier_size>0)
 	{
-		cnt_eval++;
-
 		const conn &curr = unvisited_frontier[0];
 		visited.insert(
 			std::upper_bound(visited.begin(),visited.end(),curr),
 			curr
 		);
 		num_visited++;
+		cnt_eval++;
 
 		keep.clear();
 		util::iter_each(f_nbhs(curr.u), [&](nid_t v){
 			cnt_traversed++;
-			if(!is_seen(v))
+			if(!is_seen(v)) {
+				cnt_visited++;
+				detail::try_prefetch(f_dist, v);
 				keep.push_back(v);
+			}
 		});
-		cnt_visited += keep.size();
 
 		candidates.clear();
 		for(nid_t v : keep)
 		{
 			const auto dv = f_dist(v);
 			dist_cmps++;
-			if(frontier.size()<ef || dv<frontier.back().d)
+			if(frontier_size<ef || dv<frontier[frontier_size-1].d)
 				candidates.push_back({dv,v});
 		}
 		cm::sort(candidates.begin(), candidates.end());
 
-		size_t max_cap = frontier.size() + candidates.size();
+		size_t max_cap = frontier_size + candidates.size();
 		if(new_frontier.size()<max_cap)
 			new_frontier.resize(max_cap);
 		auto new_frontier_size = std::set_union(
-			frontier.begin(), frontier.end(),
+			frontier.begin(), frontier.begin()+frontier_size,
 			candidates.begin(), candidates.end(),
 			new_frontier.begin()
 		) - new_frontier.begin(); // TODO: early stop at size of ef
@@ -258,19 +340,16 @@ auto beamSearch2(
 				std::pair{0, QP.cut * new_frontier[QP.k].second}
 			) - new_frontier.begin();
 		*/
-		new_frontier.resize(std::min<size_t>(new_frontier_size,ef));
-		frontier = std::move(new_frontier);
-		new_frontier.clear();
+		frontier_size = std::min<size_t>(new_frontier_size,ef);
+		frontier.swap(new_frontier);
 
-		if(unvisited_frontier.size()<frontier.size())
-			unvisited_frontier.resize(frontier.size());
 		size_t num_remains = std::set_difference(
-			frontier.begin(), frontier.end(),
+			frontier.begin(), frontier.begin()+frontier_size,
 			visited.begin(), visited.end(),
 			unvisited_frontier.begin()
 		) - unvisited_frontier.begin();
 
-		unvisited_frontier.resize(num_remains);
+		unvisited_frontier_size = num_remains;
 	}
 	
 	if(ctrl.log_stat)
@@ -279,7 +358,12 @@ auto beamSearch2(
 		ctrl.log_stat->cnt_visited = cnt_visited;
 		ctrl.log_stat->cnt_traversed = cnt_traversed;
 	}
-	return std::make_pair(frontier, visited);
+	// convert back to the caller's expected seq<conn> type -- ONE copy per
+	// call, not per hop, unlike the internal std::vector locals above.
+	return std::make_pair(
+		typename cm::seq<conn>(frontier.begin(), frontier.begin()+frontier_size),
+		typename cm::seq<conn>(visited.begin(), visited.end())
+	);
 }
 
 namespace detail{
@@ -347,7 +431,7 @@ auto beamSearch3(E &&f_nbhs, D &&f_dist, G &&f_label, const Seq &eps, uint32_t e
 	uint32_t limit_eval = ctrl.limit_eval.value_or(std::numeric_limits<uint32_t>::max());
 
 	while (cand.size() > 0) {
-		if (cand.begin()->d > workset[0].d * ctrl.beta) break;
+		// if (cand.begin()->d > workset[0].d * ctrl.beta) break;
 
 		if (++cnt_eval > limit_eval) break;
 
@@ -431,9 +515,6 @@ auto/*Seq*/ prune_heuristic(
 	using conn = util::conn<nid_t>;
 	static_assert(std::is_same_v<std::ranges::range_value_t<Seq>, conn>);
 
-	if(cand.size()<=size)
-		return cand;
-
 	/*std::unordered_set<nid_t> nids;
 	for(const auto &c : cand)
 		assert(nids.insert(c.u).second);*/
@@ -443,32 +524,35 @@ auto/*Seq*/ prune_heuristic(
 	std::unordered_set<nid_t> nbh;
 	res.reserve(size);
 
-	for(const conn &c : cand)
+	for(float alpha=ctrl.alpha; alpha>ctrl.alpha_min; alpha*=ctrl.alpha_exp)
 	{
-		const auto d_cu = c.d*ctrl.alpha;
-
-		bool is_pruned = false;
-		for(const conn &r : res)
+		for(const conn &c : cand)
 		{
-			const auto d_cr = f_dist(c.u, r.u);
-			if(d_cr<d_cu)
+			const auto d_cu = c.d*alpha;
+
+			bool is_pruned = false;
+			for(const conn &r : res)
 			{
-				is_pruned = true;
-				break;
+				const auto d_cr = f_dist(c.u, r.u);
+				if(d_cr<d_cu)
+				{
+					is_pruned = true;
+					break;
+				}
 			}
-		}
 
-		if(!is_pruned && ctrl.prune_nbh)
-			is_pruned = nbh.find(c.u)!=nbh.end();
+			if(!is_pruned && ctrl.prune_nbh)
+				is_pruned = nbh.find(c.u)!=nbh.end();
 
-		if(!is_pruned)
-		{
-			if(ctrl.prune_nbh)
-				util::iter_each(f_nbhs(c.u), [&](nid_t pv){nbh.insert(pv);});
-			res.push_back(c);
-			if(res.size()==size) break;
+			if(!is_pruned)
+			{
+				if(ctrl.prune_nbh)
+					util::iter_each(f_nbhs(c.u), [&](nid_t pv){nbh.insert(pv);});
+				res.push_back(c);
+				if(res.size()==size) break;
+			}
+			else pruned.push_back(c);
 		}
-		else pruned.push_back(c);
 	}
 
 	if(ctrl.recycle_pruned)
@@ -559,18 +643,19 @@ auto/*Seq*/ occlude_list(
 	static_assert(std::is_same_v<std::ranges::range_value_t<Seq>, conn>);
 	(void)f_nbhs;
 
-	if(cand.size()<=size)
+	if(cand.size()<size)
 		return cand;
 
 	cm::sort(cand.begin(), cand.end());
 
 	Seq res;
-	typename cm::seq<float> occlude_factor(cand.size());
+	// initialize to zero so the occlusion test starts from a clean state
+	typename cm::seq<float> occlude_factor(cand.size(), 0.0f);
 	res.reserve(size);
 
 	float alpha = ctrl.alpha;
 	// float alpha = 1;
-	while(alpha>ctrl.alpha_min && res.size()<size)
+	while(alpha>=ctrl.alpha_min && alpha>0 && res.size()<size)
 	{
 		for(size_t i=0; i<cand.size() && res.size()<size; ++i)
 		{
